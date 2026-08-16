@@ -1,0 +1,46 @@
+{
+  "_comment": "EventBridge Scheduler rule — triggers the ClimateInsights Phase 2 Step Functions pipeline on the 2nd of each month at 06:00 UTC. The 2nd is chosen to give NOAA time to finish publishing the previous month's data.",
+
+  "SchedulerRule": {
+    "Name":                  "climateinsights-monthly-pipeline-trigger",
+    "Description":           "Triggers ClimateInsights Phase 2 monthly analytics pipeline on 2nd of each month",
+    "ScheduleExpression":    "cron(0 6 2 * ? *)",
+    "ScheduleExpressionTimezone": "UTC",
+    "State":                 "ENABLED",
+    "FlexibleTimeWindow": {
+      "Mode":               "FLEXIBLE",
+      "MaximumWindowInMinutes": 60
+    },
+    "Target": {
+      "Arn":     "arn:aws:states:REGION:ACCOUNT_ID:stateMachine:climateinsights-monthly-pipeline",
+      "RoleArn": "arn:aws:iam::ACCOUNT_ID:role/ClimateInsightsSchedulerRole",
+      "Input": {
+        "_comment":   "year/month injected at runtime via the transformer below",
+        "bucket":     "REPLACE_WITH_YOUR_BUCKET",
+        "snsTopic":   "arn:aws:sns:REGION:ACCOUNT_ID:climateinsights-pipeline-notifications"
+      },
+      "InputTransformer": {
+        "_comment":       "EventBridge passes the scheduled time as $.time (ISO-8601). The transformer extracts year and month so the state machine always knows which period to process.",
+        "InputPathsMap": {
+          "scheduled_time": "$.time"
+        },
+        "InputTemplate": "{ \"bucket\": \"REPLACE_WITH_YOUR_BUCKET\", \"snsTopic\": \"arn:aws:sns:REGION:ACCOUNT_ID:climateinsights-pipeline-notifications\", \"year\": <aws:scheduler.scheduled-time.year>, \"month\": <aws:scheduler.scheduled-time.month> }"
+      },
+      "RetryPolicy": {
+        "MaximumRetryAttempts":      2,
+        "MaximumEventAgeInSeconds": 86400
+      },
+      "DeadLetterConfig": {
+        "Arn": "arn:aws:sqs:REGION:ACCOUNT_ID:climateinsights-dlq"
+      }
+    }
+  },
+
+  "_usage_notes": {
+    "deployment": "Use the CloudFormation template (infra/cloudformation.yaml) to deploy this rule. Or run: aws scheduler create-schedule --cli-input-json file://infra/eventbridge_scheduler.json",
+    "cron_explanation": "cron(0 6 2 * ? *) = 06:00 UTC on the 2nd of every month",
+    "year_month_injection": "EventBridge Scheduler passes its scheduled fire time. The InputTransformer extracts year/month so no Lambda is needed just to compute the current period.",
+    "dlq": "Failed invocations (Step Functions start failures) land in the DLQ for investigation",
+    "manual_trigger": "To backfill a month manually: aws stepfunctions start-execution --state-machine-arn ARN --input '{\"bucket\":\"YOUR_BUCKET\",\"snsTopic\":\"SNS_ARN\",\"year\":2020,\"month\":3}'"
+  }
+}

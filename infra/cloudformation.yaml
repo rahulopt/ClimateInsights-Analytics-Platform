@@ -1,0 +1,521 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ClimateInsights Analytics Platform — Infrastructure
+  Provisions: S3 buckets (with lifecycle), IAM roles, SNS topic,
+  SQS DLQ, Step Functions state machine, and EventBridge Scheduler rule.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+
+  ProjectName:
+    Type:        String
+    Default:     climateinsights
+    Description: Used as a prefix for all resource names.
+
+  BucketSuffix:
+    Type:        String
+    Description: >
+      Unique suffix appended to the S3 bucket name to ensure global uniqueness.
+      E.g. your AWS account ID or a short random string.
+
+  NotificationEmail:
+    Type:        String
+    Description: Email address to receive pipeline success/failure notifications.
+
+  Environment:
+    Type:        String
+    Default:     production
+    AllowedValues: [production, staging, dev]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ── S3 — Main Data Bucket ──────────────────────────────────────────────────
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-data-${BucketSuffix}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:       true
+        BlockPublicPolicy:     true
+        IgnorePublicAcls:      true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          # Landing zone: raw NOAA CSVs expire after 60 days
+          - Id:     expire-landing-zone
+            Status: Enabled
+            Filter:
+              Prefix: landing/
+            ExpirationInDays: 60
+          # EMR logs: keep 30 days then delete
+          - Id:     expire-emr-logs
+            Status: Enabled
+            Filter:
+              Prefix: logs/
+            ExpirationInDays: 30
+          # Temp / scratch: delete after 7 days
+          - Id:     expire-temp
+            Status: Enabled
+            Filter:
+              Prefix: tmp/
+            ExpirationInDays: 7
+          # Silver layer: transition to IA after 90 days (cost optimisation)
+          - Id:     silver-ia-transition
+            Status: Enabled
+            Filter:
+              Prefix: silver/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass:     STANDARD_IA
+          # Gold layer: always keep in Standard (frequently queried by Athena)
+      Tags:
+        - Key: Project     Value: !Ref ProjectName
+        - Key: Environment Value: !Ref Environment
+
+  # ── S3 Bucket Policy — deny non-SSL traffic ────────────────────────────────
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid:       DenyNonSSL
+            Effect:    Deny
+            Principal: "*"
+            Action:    "s3:*"
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub "${DataBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ── SNS — Pipeline Notifications ──────────────────────────────────────────
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:   !Sub "${ProjectName}-pipeline-notifications"
+      DisplayName: "ClimateInsights Pipeline Alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project     Value: !Ref ProjectName
+        - Key: Environment Value: !Ref Environment
+
+  # ── SQS — Dead Letter Queue for failed EventBridge invocations ─────────────
+  PipelineDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName:              !Sub "${ProjectName}-dlq"
+      MessageRetentionPeriod: 1209600   # 14 days
+      Tags:
+        - Key: Project     Value: !Ref ProjectName
+        - Key: Environment Value: !Ref Environment
+
+  # ── IAM — EMR EC2 Instance Profile ────────────────────────────────────────
+  EMRInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-emr-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect:    Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:    sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+      Policies:
+        - PolicyName: climateinsights-s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read the public NOAA source bucket
+              - Sid:      ReadPublicNOAABucket
+                Effect:   Allow
+                Action:   ["s3:GetObject", "s3:ListBucket"]
+                Resource:
+                  - "arn:aws:s3:::aws-bigdata-blog"
+                  - "arn:aws:s3:::aws-bigdata-blog/*"
+              # Full access to our own data bucket
+              - Sid:      FullAccessDataBucket
+                Effect:   Allow
+                Action:   ["s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+                           "s3:ListBucket", "s3:GetBucketLocation"]
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+      Tags:
+        - Key: Project Value: !Ref ProjectName
+
+  EMRInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-emr-ec2-profile"
+      Roles:
+        - !Ref EMRInstanceRole
+
+  # ── IAM — EMR Service Role ─────────────────────────────────────────────────
+  EMRServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-emr-service-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect:    Allow
+            Principal:
+              Service: elasticmapreduce.amazonaws.com
+            Action:    sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole
+      Tags:
+        - Key: Project Value: !Ref ProjectName
+
+  # ── IAM — Step Functions Execution Role ───────────────────────────────────
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-sfn-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect:    Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action:    sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-emr-sns-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid:    EMRClusterManagement
+                Effect: Allow
+                Action:
+                  - elasticmapreduce:RunJobFlow
+                  - elasticmapreduce:DescribeCluster
+                  - elasticmapreduce:ListSteps
+                  - elasticmapreduce:AddJobFlowSteps
+                  - elasticmapreduce:TerminateJobFlows
+                  - elasticmapreduce:SetTerminationProtection
+                Resource: "*"
+              - Sid:    PassRolesToEMR
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt EMRServiceRole.Arn
+                  - !GetAtt EMRInstanceRole.Arn
+              - Sid:    PublishToSNS
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Sid:    CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogDelivery
+                  - logs:PutLogEvents
+                Resource: "*"
+      Tags:
+        - Key: Project Value: !Ref ProjectName
+
+  # ── IAM — EventBridge Scheduler Role ──────────────────────────────────────
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect:    Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action:    sts:AssumeRole
+      Policies:
+        - PolicyName: start-step-functions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect:   Allow
+                Action:   states:StartExecution
+                Resource: !Ref PipelineStateMachine
+              - Effect:   Allow
+                Action:   sqs:SendMessage
+                Resource: !GetAtt PipelineDLQ.Arn
+      Tags:
+        - Key: Project Value: !Ref ProjectName
+
+  # ── IAM — Athena Query Role ────────────────────────────────────────────────
+  AthenaQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-athena-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect:    Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action:    sts:AssumeRole
+      Policies:
+        - PolicyName: athena-s3-glue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid:    ReadDataBucket
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+              - Sid:    WriteQueryResults
+                Effect: Allow
+                Action: ["s3:PutObject", "s3:GetObject"]
+                Resource:
+                  - !Sub "${DataBucket.Arn}/athena-results/*"
+              - Sid:    GlueRead
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                Resource: "*"
+      Tags:
+        - Key: Project Value: !Ref ProjectName
+
+  # ── Step Functions — State Machine ────────────────────────────────────────
+  PipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ProjectName}-monthly-pipeline"
+      StateMachineType: STANDARD
+      RoleArn:          !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "ClimateInsights Phase 2 Monthly Pipeline",
+          "StartAt": "ValidateInput",
+          "States": {
+            "ValidateInput": {
+              "Type": "Pass",
+              "Parameters": {
+                "year.$":  "$.year",
+                "month.$": "$.month"
+              },
+              "ResultPath": "$.params",
+              "Next": "CreateEMRCluster"
+            },
+            "CreateEMRCluster": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::elasticmapreduce:createCluster.sync",
+              "Parameters": {
+                "Name.$": "States.Format('${ProjectName}-phase2-{}-{:02d}', $.params.year, $.params.month)",
+                "ReleaseLabel": "emr-6.15.0",
+                "Applications": [{"Name": "Spark"}, {"Name": "Hadoop"}],
+                "Instances": {
+                  "InstanceGroups": [
+                    {"Name": "Master", "InstanceRole": "MASTER", "InstanceType": "m5.xlarge", "InstanceCount": 1, "Market": "ON_DEMAND"},
+                    {"Name": "Core",   "InstanceRole": "CORE",   "InstanceType": "m5.xlarge", "InstanceCount": 2, "Market": "SPOT", "BidPrice": "0.10"}
+                  ],
+                  "KeepJobFlowAliveWhenNoSteps": false,
+                  "TerminationProtected": false
+                },
+                "BootstrapActions": [{"Name": "install-deps", "ScriptBootstrapAction": {"Path": "s3://${DataBucket}/scripts/bootstrap_emr.sh"}}],
+                "Configurations": [
+                  {"Classification": "spark-env", "Configurations": [{"Classification": "export", "Properties": {"PYSPARK_PYTHON": "/usr/bin/python3"}}]},
+                  {"Classification": "spark", "Properties": {"maximizeResourceAllocation": "true"}}
+                ],
+                "JobFlowRole":    "${EMRInstanceProfile}",
+                "ServiceRole":    "${EMRServiceRole}",
+                "VisibleToAllUsers": true,
+                "AutoTerminationPolicy": {"IdleTimeout": 1800},
+                "Tags": [{"Key": "Project", "Value": "${ProjectName}"}, {"Key": "Phase", "Value": "2-monthly"}],
+                "LogUri": "s3://${DataBucket}/logs/emr/phase2/"
+              },
+              "ResultPath": "$.cluster",
+              "Next": "RunSilverAppend",
+              "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 2, "BackoffRate": 2.0}],
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}]
+            },
+            "RunSilverAppend": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::elasticmapreduce:addStep.sync",
+              "Parameters": {
+                "ClusterId.$": "$.cluster.ClusterId",
+                "Step": {
+                  "Name": "monthly-silver-append",
+                  "ActionOnFailure": "TERMINATE_CLUSTER",
+                  "HadoopJarStep": {
+                    "Jar": "command-runner.jar",
+                    "Args.$": "States.Array('spark-submit', '--deploy-mode', 'cluster', '--conf', 'spark.sql.shuffle.partitions=100', States.Format('s3://${DataBucket}/scripts/phase2/monthly_silver_append.py'), '--source_path', States.Format('s3://${DataBucket}/landing/{}/{:02d}/', $.params.year, $.params.month), '--silver_path', 's3://${DataBucket}/silver/noaa_parquet/', '--year', States.JsonToString($.params.year), '--month', States.JsonToString($.params.month))"
+                  }
+                }
+              },
+              "ResultPath": "$.silverStep",
+              "Next": "RunGoldRefresh",
+              "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 120, "MaxAttempts": 2, "BackoffRate": 2.0}],
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "TerminateClusterOnFailure"}]
+            },
+            "RunGoldRefresh": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::elasticmapreduce:addStep.sync",
+              "Parameters": {
+                "ClusterId.$": "$.cluster.ClusterId",
+                "Step": {
+                  "Name": "gold-full-refresh",
+                  "ActionOnFailure": "TERMINATE_CLUSTER",
+                  "HadoopJarStep": {
+                    "Jar": "command-runner.jar",
+                    "Args.$": "States.Array('spark-submit', '--deploy-mode', 'cluster', '--conf', 'spark.sql.shuffle.partitions=100', States.Format('s3://${DataBucket}/scripts/phase2/gold_full_refresh.py'), '--silver_path', 's3://${DataBucket}/silver/noaa_parquet/', '--gold_path', 's3://${DataBucket}/gold/', '--year', States.JsonToString($.params.year), '--month', States.JsonToString($.params.month))"
+                  }
+                }
+              },
+              "ResultPath": "$.goldStep",
+              "Next": "NotifySuccess",
+              "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 120, "MaxAttempts": 2, "BackoffRate": 2.0}],
+              "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "TerminateClusterOnFailure"}]
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Subject.$": "States.Format('[ClimateInsights] Climate Insights Ready - {} month {:02d}', $.params.year, $.params.month)",
+                "Message.$": "States.Format('Pipeline completed.\\nYear: {}\\nMonth: {}\\nData available in Silver and Gold layers.\\nQuery via Athena.', $.params.year, $.params.month)"
+              },
+              "ResultPath": "$.notification",
+              "Next": "PipelineSucceeded"
+            },
+            "PipelineSucceeded": {"Type": "Succeed"},
+            "TerminateClusterOnFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster",
+              "Parameters": {"ClusterId.$": "$.cluster.ClusterId"},
+              "ResultPath": "$.termination",
+              "Next": "NotifyFailure"
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Subject.$": "States.Format('[ClimateInsights] PIPELINE FAILED - {}/{:02d}', $.params.year, $.params.month)",
+                "Message.$": "States.Format('Pipeline FAILED.\\nYear: {}\\nMonth: {}\\nError: {}\\nCheck logs: s3://${DataBucket}/logs/emr/phase2/', $.params.year, $.params.month, States.JsonToString($.error))"
+              },
+              "ResultPath": "$.failureNotification",
+              "Next": "PipelineFailed"
+            },
+            "PipelineFailed": {"Type": "Fail", "Error": "PipelineError", "Cause": "Monthly pipeline failed"}
+          }
+        }
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Tags:
+        Project:     !Ref ProjectName
+        Environment: !Ref Environment
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:    !Sub "/aws/states/${ProjectName}-monthly-pipeline"
+      RetentionInDays: 30
+
+  # ── EventBridge Scheduler — Monthly Trigger ────────────────────────────────
+  MonthlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name:                       !Sub "${ProjectName}-monthly-trigger"
+      Description:                "Triggers ClimateInsights pipeline on 2nd of each month at 06:00 UTC"
+      ScheduleExpression:         "cron(0 6 2 * ? *)"
+      ScheduleExpressionTimezone: "UTC"
+      State:                      ENABLED
+      FlexibleTimeWindow:
+        Mode:                     FLEXIBLE
+        MaximumWindowInMinutes:   60
+      Target:
+        Arn:     !Ref PipelineStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "bucket":   "${DataBucket}",
+            "snsTopic": "${NotificationTopic}",
+            "year":     <aws:scheduler.scheduled-time.year>,
+            "month":    <aws:scheduler.scheduled-time.month>
+          }
+        RetryPolicy:
+          MaximumRetryAttempts:     2
+          MaximumEventAgeInSeconds: 86400
+        DeadLetterConfig:
+          Arn: !GetAtt PipelineDLQ.Arn
+
+  # ── Glue Database — for Athena ─────────────────────────────────────────────
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name:        climateinsights
+        Description: "ClimateInsights Silver and Gold layer Athena tables"
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+
+  DataBucketName:
+    Description: Main S3 data bucket
+    Value:        !Ref DataBucket
+    Export:
+      Name: !Sub "${ProjectName}-data-bucket"
+
+  DataBucketArn:
+    Description: ARN of the data bucket
+    Value:        !GetAtt DataBucket.Arn
+
+  NotificationTopicArn:
+    Description: SNS topic for pipeline alerts
+    Value:        !Ref NotificationTopic
+    Export:
+      Name: !Sub "${ProjectName}-sns-topic"
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value:        !Ref PipelineStateMachine
+    Export:
+      Name: !Sub "${ProjectName}-state-machine"
+
+  EMRInstanceProfileArn:
+    Description: EMR EC2 instance profile
+    Value:        !GetAtt EMRInstanceProfile.Arn
+
+  EMRServiceRoleArn:
+    Description: EMR service role ARN
+    Value:        !GetAtt EMRServiceRole.Arn
+
+  GlueDatabaseName:
+    Description: Glue/Athena database name
+    Value:        !Ref GlueDatabase
+
+  PipelineDLQUrl:
+    Description: URL of the Dead Letter Queue
+    Value:        !Ref PipelineDLQ
