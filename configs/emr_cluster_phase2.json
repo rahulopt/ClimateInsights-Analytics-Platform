@@ -1,0 +1,115 @@
+{
+  "_comment": "Phase 2 — Monthly Incremental Cluster. Launched by Step Functions. Spot + auto-terminate.",
+  "Name": "climateinsights-phase2-monthly-${YEAR}-${MONTH}",
+  "ReleaseLabel": "emr-6.15.0",
+  "Applications": [
+    { "Name": "Spark" },
+    { "Name": "Hadoop" }
+  ],
+
+  "Instances": {
+    "InstanceGroups": [
+      {
+        "Name":          "Master",
+        "InstanceRole":  "MASTER",
+        "InstanceType":  "m5.xlarge",
+        "InstanceCount": 1,
+        "Market":        "ON_DEMAND"
+      },
+      {
+        "Name":          "Core",
+        "InstanceRole":  "CORE",
+        "InstanceType":  "m5.xlarge",
+        "InstanceCount": 2,
+        "Market":        "SPOT",
+        "BidPrice":      "0.10"
+      }
+    ],
+    "KeepJobFlowAliveWhenNoSteps": false,
+    "TerminationProtected":        false
+  },
+
+  "Steps": [
+    {
+      "Name": "monthly-silver-append",
+      "ActionOnFailure": "TERMINATE_CLUSTER",
+      "HadoopJarStep": {
+        "Jar": "command-runner.jar",
+        "Args": [
+          "spark-submit",
+          "--deploy-mode", "cluster",
+          "--conf", "spark.sql.shuffle.partitions=100",
+          "--conf", "spark.sql.adaptive.enabled=true",
+          "s3://REPLACE_WITH_YOUR_BUCKET/scripts/phase2/monthly_silver_append.py",
+          "--source_path", "s3://REPLACE_WITH_YOUR_BUCKET/landing/${YEAR}/${MONTH}/",
+          "--silver_path", "s3://REPLACE_WITH_YOUR_BUCKET/silver/noaa_parquet/",
+          "--year",        "${YEAR}",
+          "--month",       "${MONTH}"
+        ]
+      }
+    },
+    {
+      "Name": "gold-full-refresh",
+      "ActionOnFailure": "TERMINATE_CLUSTER",
+      "HadoopJarStep": {
+        "Jar": "command-runner.jar",
+        "Args": [
+          "spark-submit",
+          "--deploy-mode", "cluster",
+          "--conf", "spark.sql.shuffle.partitions=100",
+          "s3://REPLACE_WITH_YOUR_BUCKET/scripts/phase2/gold_full_refresh.py",
+          "--silver_path", "s3://REPLACE_WITH_YOUR_BUCKET/silver/noaa_parquet/",
+          "--gold_path",   "s3://REPLACE_WITH_YOUR_BUCKET/gold/",
+          "--year",        "${YEAR}",
+          "--month",       "${MONTH}"
+        ]
+      }
+    }
+  ],
+
+  "BootstrapActions": [
+    {
+      "Name": "install-dependencies",
+      "ScriptBootstrapAction": {
+        "Path": "s3://REPLACE_WITH_YOUR_BUCKET/scripts/bootstrap_emr.sh"
+      }
+    }
+  ],
+
+  "Configurations": [
+    {
+      "Classification": "spark-env",
+      "Configurations": [
+        {
+          "Classification": "export",
+          "Properties": {
+            "PYSPARK_PYTHON": "/usr/bin/python3"
+          }
+        }
+      ]
+    },
+    {
+      "Classification": "spark",
+      "Properties": {
+        "maximizeResourceAllocation": "true"
+      }
+    }
+  ],
+
+  "JobFlowRole":    "EMR_EC2_DefaultRole",
+  "ServiceRole":    "EMR_DefaultRole",
+  "VisibleToAllUsers": true,
+
+  "AutoTerminationPolicy": {
+    "IdleTimeout": 1800
+  },
+
+  "Tags": [
+    { "Key": "Project",     "Value": "ClimateInsights"  },
+    { "Key": "Phase",       "Value": "2-monthly"         },
+    { "Key": "Environment", "Value": "production"        },
+    { "Key": "ManagedBy",   "Value": "step-functions"    }
+  ],
+
+  "LogUri": "s3://REPLACE_WITH_YOUR_BUCKET/logs/emr/phase2/"
+}

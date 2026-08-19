@@ -1,0 +1,113 @@
+{
+  "_comment": "Phase 1 — Historical Backfill Cluster. One-time transient job. Spot instances acceptable.",
+  "Name": "climateinsights-phase1-backfill",
+  "ReleaseLabel": "emr-6.15.0",
+  "Applications": [
+    { "Name": "Spark" },
+    { "Name": "Hadoop" }
+  ],
+
+  "Instances": {
+    "InstanceGroups": [
+      {
+        "Name":          "Master",
+        "InstanceRole":  "MASTER",
+        "InstanceType":  "m5.xlarge",
+        "InstanceCount": 1,
+        "Market":        "ON_DEMAND"
+      },
+      {
+        "Name":          "Core",
+        "InstanceRole":  "CORE",
+        "InstanceType":  "m5.xlarge",
+        "InstanceCount": 4,
+        "Market":        "SPOT",
+        "BidPrice":      "0.10"
+      }
+    ],
+    "KeepJobFlowAliveWhenNoSteps": false,
+    "TerminationProtected":        false
+  },
+
+  "Steps": [
+    {
+      "Name": "bronze-to-silver",
+      "ActionOnFailure": "TERMINATE_CLUSTER",
+      "HadoopJarStep": {
+        "Jar": "command-runner.jar",
+        "Args": [
+          "spark-submit",
+          "--deploy-mode", "cluster",
+          "--conf", "spark.sql.shuffle.partitions=200",
+          "--conf", "spark.sql.adaptive.enabled=true",
+          "s3://REPLACE_WITH_YOUR_BUCKET/scripts/phase1/bronze_to_silver.py",
+          "--source_path",      "s3://aws-bigdata-blog/artifacts/athena-ctas-insert-into-blog/",
+          "--silver_path",      "s3://REPLACE_WITH_YOUR_BUCKET/silver/noaa_parquet/",
+          "--year_start",       "2010",
+          "--year_end",         "2019"
+        ]
+      }
+    },
+    {
+      "Name": "silver-to-gold",
+      "ActionOnFailure": "TERMINATE_CLUSTER",
+      "HadoopJarStep": {
+        "Jar": "command-runner.jar",
+        "Args": [
+          "spark-submit",
+          "--deploy-mode", "cluster",
+          "--conf", "spark.sql.shuffle.partitions=200",
+          "s3://REPLACE_WITH_YOUR_BUCKET/scripts/phase1/silver_to_gold.py",
+          "--silver_path", "s3://REPLACE_WITH_YOUR_BUCKET/silver/noaa_parquet/",
+          "--gold_path",   "s3://REPLACE_WITH_YOUR_BUCKET/gold/"
+        ]
+      }
+    }
+  ],
+
+  "BootstrapActions": [
+    {
+      "Name": "install-dependencies",
+      "ScriptBootstrapAction": {
+        "Path": "s3://REPLACE_WITH_YOUR_BUCKET/scripts/bootstrap_emr.sh"
+      }
+    }
+  ],
+
+  "Configurations": [
+    {
+      "Classification": "spark-env",
+      "Configurations": [
+        {
+          "Classification": "export",
+          "Properties": {
+            "PYSPARK_PYTHON": "/usr/bin/python3"
+          }
+        }
+      ]
+    },
+    {
+      "Classification": "spark",
+      "Properties": {
+        "maximizeResourceAllocation": "true"
+      }
+    }
+  ],
+
+  "JobFlowRole":    "EMR_EC2_DefaultRole",
+  "ServiceRole":    "EMR_DefaultRole",
+  "VisibleToAllUsers": true,
+
+  "AutoTerminationPolicy": {
+    "IdleTimeout": 3600
+  },
+
+  "Tags": [
+    { "Key": "Project",     "Value": "ClimateInsights"  },
+    { "Key": "Phase",       "Value": "1-backfill"        },
+    { "Key": "Environment", "Value": "production"        },
+    { "Key": "ManagedBy",   "Value": "manual-launch"     }
+  ],
+
+  "LogUri": "s3://REPLACE_WITH_YOUR_BUCKET/logs/emr/phase1/"
+}
